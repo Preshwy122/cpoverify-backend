@@ -4,6 +4,30 @@ const admin = require("firebase-admin");
 
 const app = express();
 
+// Allow requests from the CPOVERIFY website
+app.use((req, res, next) => {
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    "https://preshwy122.github.io"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Authorization, Content-Type"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, POST, OPTIONS"
+  );
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+
+  next();
+});
+
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
