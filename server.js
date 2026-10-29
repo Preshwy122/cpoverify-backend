@@ -1,67 +1,3 @@
-// SameehaSocialHub provider API
-const PROVIDER_URL = "https://sameehasocialhub.com/api/v1";
-
-// Fetch provider categories
-app.get("/api/provider/categories", async (req, res) => {
-  try {
-    const response = await fetch(
-      `${PROVIDER_URL}/categories`,
-      {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${process.env.SAMEEHA_API_KEY}`
-        }
-      }
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      return res.status(response.status).json({
-        error: "Unable to fetch provider categories"
-      });
-    }
-
-    res.json(data);
-  } catch (error) {
-    console.error("Provider categories error:", error.message);
-
-    res.status(500).json({
-      error: "Provider connection failed"
-    });
-  }
-});
-
-// Fetch provider products
-app.get("/api/provider/products", async (req, res) => {
-  try {
-    const response = await fetch(
-      `${PROVIDER_URL}/products`,
-      {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${process.env.SAMEEHA_API_KEY}`
-        }
-      }
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      return res.status(response.status).json({
-        error: "Unable to fetch provider products"
-      });
-    }
-
-    res.json(data);
-  } catch (error) {
-    console.error("Provider products error:", error.message);
-
-    res.status(500).json({
-      error: "Provider connection failed"
-    });
-  }
-});
 
 const express = require("express");
 const admin = require("firebase-admin");
@@ -199,6 +135,71 @@ app.get("/api/wallet", verifyFirebaseUser, async (req, res) => {
 
     res.status(500).json({
       error: "Unable to retrieve wallet balance"
+    });
+  }
+});
+
+// SameehaSocialHub provider API
+const PROVIDER_URL = "https://sameehasocialhub.com/api/v1";
+
+// Fetch provider categories
+app.get("/api/provider/categories", async (req, res) => {
+  try {
+    const response = await fetch(
+      `${PROVIDER_URL}/categories`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${process.env.SAMEEHA_API_KEY}`
+        }
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      return res.status(502).json({
+        error: "Provider categories request failed"
+      });
+    }
+
+    res.json(data);
+  } catch (error) {
+    console.error("Provider categories error:", error.message);
+
+    res.status(500).json({
+      error: "Provider connection failed"
+    });
+  }
+});
+
+// Fetch provider products
+app.get("/api/provider/products", async (req, res) => {
+  try {
+    const response = await fetch(
+      `${PROVIDER_URL}/products`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${process.env.SAMEEHA_API_KEY}`
+        }
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      return res.status(502).json({
+        error: "Provider products request failed"
+      });
+    }
+
+    res.json(data);
+  } catch (error) {
+    console.error("Provider products error:", error.message);
+
+    res.status(500).json({
+      error: "Provider connection failed"
     });
   }
 });
