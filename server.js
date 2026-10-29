@@ -1,4 +1,3 @@
-
 const express = require("express");
 const admin = require("firebase-admin");
 
@@ -67,6 +66,25 @@ async function verifyFirebaseUser(req, res, next) {
   }
 }
 
+// Verify admin user
+function verifyAdmin(req, res, next) {
+  const adminUID = process.env.ADMIN_UID;
+
+  if (!adminUID) {
+    return res.status(503).json({
+      error: "Admin is not configured"
+    });
+  }
+
+  if (req.user.uid !== adminUID) {
+    return res.status(403).json({
+      error: "Admin access required"
+    });
+  }
+
+  next();
+}
+
 // Get authenticated user
 app.get("/api/me", verifyFirebaseUser, (req, res) => {
   res.json({
@@ -74,6 +92,19 @@ app.get("/api/me", verifyFirebaseUser, (req, res) => {
     email: req.user.email || null
   });
 });
+
+// Check admin access
+app.get(
+  "/api/admin/check",
+  verifyFirebaseUser,
+  verifyAdmin,
+  (req, res) => {
+    res.json({
+      admin: true,
+      message: "Admin access verified"
+    });
+  }
+);
 
 // Get authenticated user's wallet balance
 app.get("/api/wallet", verifyFirebaseUser, async (req, res) => {
