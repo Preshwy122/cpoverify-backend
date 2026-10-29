@@ -1,3 +1,4 @@
+
 const express = require("express");
 const admin = require("firebase-admin");
 
@@ -7,7 +8,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// Initialize Firebase Admin using Render environment variables
+// Initialize Firebase Admin
 if (!admin.apps.length) {
   const serviceAccount = {
     projectId: process.env.FIREBASE_PROJECT_ID,
@@ -37,7 +38,7 @@ app.get("/", (req, res) => {
   });
 });
 
-// Authentication middleware
+// Verify Firebase user
 async function verifyFirebaseUser(req, res, next) {
   try {
     const authHeader = req.headers.authorization || "";
@@ -66,12 +67,44 @@ async function verifyFirebaseUser(req, res, next) {
   }
 }
 
-// Check authenticated user
+// Get authenticated user
 app.get("/api/me", verifyFirebaseUser, (req, res) => {
   res.json({
     uid: req.user.uid,
     email: req.user.email || null
   });
+});
+
+// Get authenticated user's wallet balance
+app.get("/api/wallet", verifyFirebaseUser, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+
+    const snapshot = await admin
+      .database()
+      .ref(`users/${uid}/wallet/balance`)
+      .get();
+
+    const balance = snapshot.exists()
+      ? Number(snapshot.val())
+      : 0;
+
+    if (!Number.isFinite(balance) || balance < 0) {
+      return res.status(500).json({
+        error: "Wallet balance data is invalid"
+      });
+    }
+
+    res.json({
+      balance
+    });
+  } catch (error) {
+    console.error("Wallet read error:", error.message);
+
+    res.status(500).json({
+      error: "Unable to retrieve wallet balance"
+    });
+  }
 });
 
 // Start server
