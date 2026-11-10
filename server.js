@@ -6,33 +6,34 @@ const crypto = require("crypto");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const FRONTEND_ORIGIN =
-  process.env.FRONTEND_ORIGIN || "https://preshwy122.github.io";
+const FRONTEND_ORIGIN = "https://preshwy122.github.io";
 
 const WICKSPEND_URL =
-  process.env.WICKSPEND_BASE_URL || "https://wickspend.com/api/v1";
+  (process.env.WICKSPEND_BASE_URL || "https://wickspend.com/api/v1")
+    .replace(/\/+$/, "");
 
-const SAMEEHA_URL = "https://sameehasocialhub.com/api/v1";
+const SAMEEHA_URL =
+  "https://sameehasocialhub.com/api/v1";
 
 const MYSMM_URL =
-  process.env.MYSMM_BASE_URL || "https://mysmm.co/api/v2";
+  (process.env.MYSMM_BASE_URL || "https://mysmm.co/api/v2")
+    .replace(/\/+$/, "");
 
-const USD_TO_NGN_RATE = Number(process.env.USD_TO_NGN_RATE || 1400);
-const BOOST_MARKUP_PERCENT = Number(
-  process.env.BOOST_MARKUP_PERCENT || 20
-);
+const USD_TO_NGN_RATE =
+  Number(process.env.USD_TO_NGN_RATE || 1400);
 
-// MySMM rate units must be confirmed before enabling orders.
-// Set MYSMM_RATE_UNIT to "per1000" or "perunit" only after
-// confirming how mysmm.co calculates its service rates.
+const BOOST_MARKUP_PERCENT =
+  Number(process.env.BOOST_MARKUP_PERCENT || 20);
 
-const MYSMM_RATE_UNIT = process.env.MYSMM_RATE_UNIT || "";
+// --------------------------------------------------
+// CORS AND BODY PARSING
+// --------------------------------------------------
 
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", FRONTEND_ORIGIN);
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "Authorization, Content-Type, Idempotency-Key"
+    "Authorization, Content-Type"
   );
   res.setHeader(
     "Access-Control-Allow-Methods",
@@ -49,140 +50,167 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: "1mb" }));
 
 // --------------------------------------------------
-// FIREBASE INITIALIZATION
+// FIREBASE ADMIN INITIALIZATION
 // --------------------------------------------------
 
 if (!admin.apps.length) {
-  const privateKey = process.env.FIREBASE_PRIVATE_KEY
-    ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
-    : undefined;
+  const serviceAccount = {
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    privateKey: process.env.FIREBASE_PRIVATE_KEY
+      ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
+      : undefined
+  };
 
   if (
-    process.env.FIREBASE_PROJECT_ID &&
-    process.env.FIREBASE_CLIENT_EMAIL &&
-    privateKey &&
-    process.env.FIREBASE_DATABASE_URL
+    serviceAccount.projectId &&
+    serviceAccount.clientEmail &&
+    serviceAccount.privateKey
   ) {
     admin.initializeApp({
-      credential: admin.credential.cert({
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey
-      }),
+      credential: admin.credential.cert(serviceAccount),
       databaseURL: process.env.FIREBASE_DATABASE_URL
     });
   }
 }
 
-function db() {
+function database() {
   if (!admin.apps.length) {
-    throw new Error("Firebase backend is not configured");
+    throw new Error("Firebase backend is not configured.");
   }
 
   return admin.database();
 }
 
 // --------------------------------------------------
-// COMMON HELPERS
+// GENERAL HELPERS
 // --------------------------------------------------
 
-function safeNumber(value, fallback = 0) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : fallback;
+function cleanString(value, maxLength = 300) {
+  return typeof value === "string"
+    ? value.trim().slice(0, maxLength)
+    : "";
 }
 
-function validText(value, max = 200) {
-  return typeof value === "string" &&
-    value.trim().length > 0 &&
-    value.trim().length <= max;
+function validMoney(value) {
+  const amount = Number(value);
+
+  return Number.isFinite(amount) &&
+    amount >= 0 &&
+    Math.round(amount * 100) / 100 === amount;
 }
 
-function makeRequestKey(value) {
-  if (validText(value, 120) && value.trim().length >= 8) {
-    return value.trim();
+function money(value) {
+  return Math.round(Number(value) * 100) / 100;
+}
+
+function makeId() {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function safeRequestKey(value) {
+  const key = cleanString(value, 100);
+
+  if (!/^[a-zA-Z0-9_-]{8,100}$/.test(key)) {
+    throw new Error(
+      "A valid request_key containing 8–100 letters, numbers, underscores or hyphens is required."
+    );
   }
 
-  return null;
+  return key;
 }
 
-function errorResponse(res, error, status = 500) {
-  console.error(error);
-  return res.status(status).json({
-    error: "The request could not be completed"
-  });
+function providerErrorMessage(data, fallback) {
+  if (!data) return fallback;
+
+  return cleanString(
+    data.error ||
+    data.message ||
+    data.description ||
+    data.detail,
+    500
+  ) || fallback;
 }
 
-async function providerRequest(url, options = {}) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
+async function readProviderResponse(response) {
+  const text = await response.text();
+
+  let data;
 
   try {
-    const response = await fetch(url, {
-      ...options,
-      signal: controller.signal
-    });
-
-    const text = await response.text();
-    let data;
-
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {
-      data = { raw: text };
-    }
-
-    return {
-      status: response.status,
-      ok: response.ok,
-      data
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function wickHeaders() {
-  if (!process.env.WICKSPEND_API_KEY) {
-    throw new Error("WICKSPEND_API_KEY is missing");
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { raw: text };
   }
 
   return {
-    "X-API-Key": process.env.WICKSPEND_API_KEY,
-    "Content-Type": "application/json"
+    ok: response.ok,
+    status: response.status,
+    data
   };
 }
 
-function mySmmUrl(action) {
-  if (!process.env.MYSMM_API_KEY) {
-    throw new Error("MYSMM_API_KEY is missing");
-  }
+async function providerFetch(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    signal: AbortSignal.timeout(30000)
+  });
 
-  const url = new URL(MYSMM_URL);
-  url.searchParams.set("key", process.env.MYSMM_API_KEY);
-  url.searchParams.set("action", action);
-  return url;
+  return readProviderResponse(response);
 }
 
-async function getJson(url, headers = {}) {
-  return providerRequest(url, {
-    method: "GET",
-    headers
+function sendProviderError(res, result, fallback) {
+  console.error("Provider error:", result.status, result.data);
+
+  return res.status(502).json({
+    error: providerErrorMessage(result.data, fallback),
+    providerStatus: result.status
   });
 }
 
-async function postJson(url, body, headers = {}) {
-  return providerRequest(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...headers
-    },
-    body: JSON.stringify(body)
-  });
+function extractReference(data) {
+  if (!data || typeof data !== "object") return null;
+
+  const possible = [
+    data.reference,
+    data.order_reference,
+    data.orderReference,
+    data.order_id,
+    data.orderId,
+    data.id,
+    data.data?.reference,
+    data.data?.order_reference,
+    data.data?.order_id,
+    data.data?.id
+  ];
+
+  const found = possible.find(
+    value => typeof value === "string" || typeof value === "number"
+  );
+
+  return found === undefined ? null : String(found);
+}
+
+function confirmedProviderSuccess(data) {
+  if (!data || typeof data !== "object") return false;
+
+  if (data.success === true || data.cancelled === true) return true;
+
+  const status = String(
+    data.status || data.state || ""
+  ).toLowerCase();
+
+  return [
+    "cancelled",
+    "canceled",
+    "refunded",
+    "success",
+    "completed"
+  ].includes(status);
 }
 
 // --------------------------------------------------
-// AUTHENTICATION
+// FIREBASE AUTHENTICATION
 // --------------------------------------------------
 
 async function verifyFirebaseUser(req, res, next) {
@@ -191,19 +219,23 @@ async function verifyFirebaseUser(req, res, next) {
 
     if (!header.startsWith("Bearer ")) {
       return res.status(401).json({
-        error: "Authentication required"
+        error: "Authentication required."
       });
     }
 
-    const decoded = await admin.auth().verifyIdToken(
-      header.slice(7)
-    );
+    if (!admin.apps.length) {
+      return res.status(503).json({
+        error: "Firebase backend is not configured."
+      });
+    }
 
-    req.user = decoded;
+    const token = header.slice(7);
+    req.user = await admin.auth().verifyIdToken(token);
+
     next();
-  } catch {
+  } catch (error) {
     return res.status(401).json({
-      error: "Invalid or expired authentication token"
+      error: "Invalid or expired authentication token."
     });
   }
 }
@@ -213,1591 +245,1810 @@ function verifyAdmin(req, res, next) {
 
   if (!adminUID) {
     return res.status(503).json({
-      error: "ADMIN_UID is not configured"
+      error: "ADMIN_UID is not configured in Render."
     });
   }
 
   if (req.user.uid !== adminUID) {
     return res.status(403).json({
-      error: "Admin access required"
+      error: "Admin access required."
     });
   }
 
   next();
 }
 
-// --------------------------------------------------
-// WALLET HELPERS
-// Amounts are stored in NGN.
-// --------------------------------------------------
-
-async function changeWallet(uid, amount, transactionId, type, details = {}) {
-  if (!Number.isSafeInteger(amount) || amount <= 0) {
-    throw new Error("Invalid wallet amount");
-  }
-
-  const root = db().ref(`users/${uid}/wallet`);
-  const balanceRef = root.child("balance");
-
-  const transactionRef = db().ref(
-    `users/${uid}/transactions/${transactionId}`
-  );
-
-  const existing = await transactionRef.get();
-
-  if (existing.exists()) {
-    return {
-      duplicate: true,
-      balance: safeNumber((await balanceRef.get()).val())
-    };
-  }
-
-  if (type === "debit") {
-    const result = await balanceRef.transaction(current => {
-      const balance = safeNumber(current);
-
-      if (balance < amount) {
-        return;
-      }
-
-      return balance - amount;
-    });
-
-    if (!result.committed) {
-      throw new Error("INSUFFICIENT_BALANCE");
-    }
-  } else {
-    await balanceRef.transaction(current => {
-      return safeNumber(current) + amount;
-    });
-  }
-
-  await transactionRef.set({
-    type,
-    amount,
-    details,
-    createdAt: admin.database.ServerValue.TIMESTAMP
-  });
-
-  return {
-    duplicate: false,
-    balance: safeNumber((await balanceRef.get()).val())
-  };
-}
-
-async function refundWallet(uid, amount, transactionId, details = {}) {
-  return changeWallet(
-    uid,
-    amount,
-    transactionId,
-    "credit",
-    {
-      reason: "Confirmed provider refund",
-      ...details
-    }
-  );
-}
+const authenticated = verifyFirebaseUser;
+const administrator = [verifyFirebaseUser, verifyAdmin];
 
 // --------------------------------------------------
-// HEALTH / USER / ADMIN
+// HEALTH CHECK AND USER INFORMATION
 // --------------------------------------------------
 
 app.get("/", (req, res) => {
   res.json({
     name: "CPOVERIFY Backend",
-    status: "running"
+    status: "running",
+    providers: {
+      wickspend: "Numbers only",
+      sameeha: "Account Logs",
+      mysmm: "Account Boosting"
+    }
   });
 });
 
-app.get("/api/me", verifyFirebaseUser, (req, res) => {
+app.get("/api/me", authenticated, (req, res) => {
   res.json({
     uid: req.user.uid,
     email: req.user.email || null
   });
 });
 
-app.get(
-  "/api/admin/check",
-  verifyFirebaseUser,
-  verifyAdmin,
-  (req, res) => {
-    res.json({ admin: true });
-  }
-);
-
-app.get("/api/wallet", verifyFirebaseUser, async (req, res) => {
-  try {
-    const snapshot = await db()
-      .ref(`users/${req.user.uid}/wallet/balance`)
-      .get();
-
-    res.json({
-      balance: safeNumber(snapshot.val())
-    });
-  } catch (error) {
-    errorResponse(res, error);
-  }
+app.get("/api/admin/check", ...administrator, (req, res) => {
+  res.json({
+    admin: true,
+    message: "Admin access verified."
+  });
 });
 
 // --------------------------------------------------
-// ADMIN PRICING
+// WALLET
 //
-// Structure:
-// settings/pricing/{provider}/{type}/{serviceId}
-//
-// Examples:
-// wickspend/numbers/OFFER_ID
-// wickspend/rentals/OFFER_ID
-// sameeha/logs/SERVICE_ID
+// Wallet balance is stored as ordinary naira amounts.
+// Example: 5000 means ₦5,000.
+// Transactions and balance changes are committed
+// together inside the wallet transaction.
 // --------------------------------------------------
 
-app.get(
-  "/api/admin/pricing",
-  verifyFirebaseUser,
-  verifyAdmin,
-  async (req, res) => {
-    try {
-      const snapshot = await db().ref("settings/pricing").get();
-      res.json(snapshot.val() || {});
-    } catch (error) {
-      errorResponse(res, error);
-    }
+async function changeWallet(uid, amount, transactionId, type, details = {}) {
+  amount = money(amount);
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error("Invalid wallet amount.");
   }
-);
 
-app.put(
-  "/api/admin/pricing/:provider/:type/:serviceId",
-  verifyFirebaseUser,
-  verifyAdmin,
+  const walletRef = database().ref(`users/${uid}/wallet`);
+
+  const result = await walletRef.transaction(wallet => {
+    wallet = wallet || {};
+
+    const transactions = wallet.transactions || {};
+
+    // Prevent the same debit/refund from being applied twice.
+    if (transactions[transactionId]) {
+      return;
+    }
+
+    const currentBalance = Number(wallet.balance || 0);
+
+    if (!Number.isFinite(currentBalance) || currentBalance < 0) {
+      return;
+    }
+
+    if (type === "debit" && currentBalance < amount) {
+      return;
+    }
+
+    const newBalance = type === "debit"
+      ? money(currentBalance - amount)
+      : money(currentBalance + amount);
+
+    wallet.balance = newBalance;
+
+    transactions[transactionId] = {
+      id: transactionId,
+      type,
+      amount,
+      currency: "NGN",
+      description: cleanString(details.description || type, 200),
+      reference: cleanString(details.reference || "", 150),
+      createdAt: Date.now()
+    };
+
+    wallet.transactions = transactions;
+
+    return wallet;
+  });
+
+  if (!result.committed) {
+    const current = await walletRef.once("value");
+    const wallet = current.val() || {};
+
+    if ((wallet.transactions || {})[transactionId]) {
+      return {
+        alreadyProcessed: true,
+        balance: Number(wallet.balance || 0)
+      };
+    }
+
+    if (
+      type === "debit" &&
+      Number(wallet.balance || 0) < amount
+    ) {
+      throw new Error("Insufficient wallet balance.");
+    }
+
+    throw new Error("Wallet transaction could not be completed.");
+  }
+
+  return {
+    alreadyProcessed: false,
+    balance: Number(result.snapshot.val().balance || 0)
+  };
+}
+
+async function debitWallet(uid, amount, requestKey, description) {
+  return changeWallet(
+    uid,
+    amount,
+    `debit_${requestKey}`,
+    "debit",
+    { description }
+  );
+}
+
+async function refundWallet(uid, amount, requestKey, description) {
+  return changeWallet(
+    uid,
+    amount,
+    `refund_${requestKey}`,
+    "refund",
+    { description }
+  );
+}
+
+app.get("/api/wallet", authenticated, async (req, res) => {
+  try {
+    const snapshot = await database()
+      .ref(`users/${req.user.uid}/wallet/balance`)
+      .once("value");
+
+    const balance = snapshot.exists()
+      ? Number(snapshot.val())
+      : 0;
+
+    if (!Number.isFinite(balance) || balance < 0) {
+      return res.status(500).json({
+        error: "Wallet balance data is invalid."
+      });
+    }
+
+    res.json({
+      balance,
+      currency: "NGN"
+    });
+  } catch (error) {
+    console.error("Wallet read error:", error.message);
+
+    res.status(500).json({
+      error: "Unable to retrieve wallet balance."
+    });
+  }
+});
+
+// Admin manually credits a user's wallet.
+// Supply the user's Firebase UID and amount in naira.
+app.post(
+  "/api/admin/wallet/credit",
+  ...administrator,
   async (req, res) => {
     try {
-      const { provider, type, serviceId } = req.params;
-      const price = Number(req.body.price);
+      const uid = cleanString(req.body.uid, 150);
+      const amount = Number(req.body.amount);
+      const description = cleanString(
+        req.body.description || "Admin wallet credit",
+        200
+      );
 
-      const allowed = {
-        wickspend: ["numbers", "rentals"],
-        sameeha: ["logs"]
-      };
-
-      if (
-        !allowed[provider] ||
-        !allowed[provider].includes(type) ||
-        !validText(serviceId, 150) ||
-        !Number.isFinite(price) ||
-        price < 0
-      ) {
+      if (!uid || !validMoney(amount) || amount <= 0) {
         return res.status(400).json({
-          error: "Invalid pricing details"
+          error: "A valid user UID and naira amount are required."
         });
       }
 
-      await db()
-        .ref(`settings/pricing/${provider}/${type}/${serviceId}`)
-        .set({
-          price,
-          updatedAt: admin.database.ServerValue.TIMESTAMP
-        });
+      const creditId = makeId();
+
+      const result = await changeWallet(
+        uid,
+        amount,
+        `admin_credit_${creditId}`,
+        "credit",
+        { description }
+      );
 
       res.json({
         success: true,
-        price
+        balance: result.balance,
+        currency: "NGN"
       });
     } catch (error) {
-      errorResponse(res, error);
+      console.error("Admin credit error:", error.message);
+
+      res.status(500).json({
+        error: error.message || "Unable to credit wallet."
+      });
     }
   }
 );
 
-async function attachPrices(items, provider, type, idFields) {
-  const snapshot = await db()
-    .ref(`settings/pricing/${provider}/${type}`)
-    .get();
+// --------------------------------------------------
+// PURCHASE REQUEST RESERVATION
+//
+// A request key is reserved before contacting a provider.
+// A repeated request key will never start a second purchase.
+// --------------------------------------------------
 
-  const prices = snapshot.val() || {};
+async function reservePurchase(uid, requestKey, record) {
+  const ref = database().ref(
+    `users/${uid}/purchaseRequests/${requestKey}`
+  );
 
-  if (!Array.isArray(items)) {
-    return items;
-  }
-
-  return items.map(item => {
-    let id = null;
-
-    for (const field of idFields) {
-      if (item && item[field] !== undefined) {
-        id = String(item[field]);
-        break;
-      }
-    }
+  const result = await ref.transaction(existing => {
+    if (existing) return;
 
     return {
-      ...item,
-      customerPrice: id && prices[id]
-        ? safeNumber(prices[id].price)
-        : null
+      ...record,
+      requestKey,
+      createdAt: Date.now(),
+      status: "reserved"
     };
   });
+
+  if (!result.committed) {
+    return {
+      created: false,
+      record: result.snapshot.val()
+    };
+  }
+
+  return {
+    created: true,
+    record: result.snapshot.val()
+  };
+}
+
+async function updatePurchase(uid, requestKey, changes) {
+  await database()
+    .ref(`users/${uid}/purchaseRequests/${requestKey}`)
+    .update({
+      ...changes,
+      updatedAt: Date.now()
+    });
 }
 
 // --------------------------------------------------
-// SAMEEHA SOCIAL HUB — ACCOUNT LOGS
+// WICKSPEND: NUMBERS ONLY
+// Long rentals are intentionally not included.
 // --------------------------------------------------
 
+function wickspendHeaders() {
+  if (!process.env.WICKSPEND_API_KEY) {
+    throw new Error("WICKSPEND_API_KEY is not configured.");
+  }
+
+  return {
+    "X-API-Key": process.env.WICKSPEND_API_KEY,
+    "Content-Type": "application/json"
+  };
+}
+
+async function wickspendGet(path) {
+  return providerFetch(WICKSPEND_URL + path, {
+    method: "GET",
+    headers: wickspendHeaders()
+  });
+}
+
+async function wickspendPost(path, body) {
+  return providerFetch(WICKSPEND_URL + path, {
+    method: "POST",
+    headers: wickspendHeaders(),
+    body: JSON.stringify(body)
+  });
+}
+
+// Admin: inspect WickSpend's live number catalogue.
+// The raw provider response is returned for admin review.
 app.get(
-  "/api/provider/categories",
-  verifyFirebaseUser,
+  "/api/admin/wickspend/provider/numbers/catalog",
+  ...administrator,
   async (req, res) => {
     try {
-      const result = await getJson(
-        `${SAMEEHA_URL}/categories`,
-        {
-          Authorization: `Bearer ${process.env.SAMEEHA_API_KEY}`
-        }
-      );
+      const result = await wickspendGet("/numbers/catalog");
 
       if (!result.ok) {
-        return res.status(502).json({
-          error: "Sameeha categories request failed"
-        });
+        return sendProviderError(
+          res,
+          result,
+          "Unable to load WickSpend number catalogue."
+        );
       }
 
       res.json(result.data);
     } catch (error) {
-      errorResponse(res, error, 502);
+      console.error("WickSpend catalogue error:", error.message);
+
+      res.status(500).json({
+        error: error.message || "WickSpend connection failed."
+      });
     }
   }
 );
 
+// Admin: inspect WickSpend wallet balance.
 app.get(
-  "/api/provider/products",
-  verifyFirebaseUser,
+  "/api/admin/wickspend/provider/balance",
+  ...administrator,
   async (req, res) => {
     try {
-      const result = await getJson(
-        `${SAMEEHA_URL}/products`,
-        {
-          Authorization: `Bearer ${process.env.SAMEEHA_API_KEY}`
-        }
-      );
+      const result = await wickspendGet("/balance");
 
       if (!result.ok) {
-        return res.status(502).json({
-          error: "Sameeha products request failed"
-        });
+        return sendProviderError(
+          res,
+          result,
+          "Unable to retrieve WickSpend balance."
+        );
       }
 
-      const items = Array.isArray(result.data)
-        ? result.data
-        : Array.isArray(result.data.products)
-          ? result.data.products
-          : [];
-
-      const priced = await attachPrices(
-        items,
-        "sameeha",
-        "logs",
-        ["service", "id", "product_id", "service_id"]
-      );
-
-      res.json(priced);
+      res.json(result.data);
     } catch (error) {
-      errorResponse(res, error, 502);
+      res.status(500).json({
+        error: error.message || "WickSpend connection failed."
+      });
     }
   }
 );
 
 // --------------------------------------------------
-// MANUALLY ADDED ACCOUNT LOGS
+// ADMIN-MANAGED WICKSPEND NUMBER OFFERS
+//
+// Firebase location:
+// settings/wickspendOffers/numbers/{offerId}
+//
+// Admin sets provider identifiers and retail price.
+// Customers cannot submit their own provider IDs or price.
 // --------------------------------------------------
 
+function validateNumberOffer(body) {
+  const offer = {
+    country: cleanString(body.country, 100),
+    country_code: cleanString(body.country_code, 30),
+    service: cleanString(body.service, 120),
+    service_code: cleanString(body.service_code, 100),
+    provider_id: cleanString(String(body.provider_id || ""), 150),
+    offer_id: cleanString(String(body.offer_id || ""), 150),
+    price: Number(body.price),
+    active: body.active !== false
+  };
+
+  if (
+    !offer.country ||
+    !offer.country_code ||
+    !offer.service ||
+    !offer.service_code ||
+    !offer.provider_id ||
+    !validMoney(offer.price) ||
+    offer.price <= 0
+  ) {
+    throw new Error(
+      "Country, country code, service, service code, provider ID and a valid naira price are required."
+    );
+  }
+
+  return offer;
+}
+
 app.get(
-  "/api/manual-logs",
-  verifyFirebaseUser,
+  "/api/admin/wickspend/offers/numbers",
+  ...administrator,
   async (req, res) => {
     try {
-      const snapshot = await db().ref("manualLogs").get();
-      const logs = snapshot.val() || {};
+      const snapshot = await database()
+        .ref("settings/wickspendOffers/numbers")
+        .once("value");
 
-      const result = Object.entries(logs)
-        .filter(([, item]) => item && item.active !== false)
-        .map(([id, item]) => ({ id, ...item }));
+      const offers = snapshot.val() || {};
 
-      res.json(result);
+      res.json({
+        offers: Object.entries(offers).map(([id, offer]) => ({
+          id,
+          ...offer
+        }))
+      });
     } catch (error) {
-      errorResponse(res, error);
+      res.status(500).json({
+        error: "Unable to load number offers."
+      });
     }
   }
 );
 
 app.post(
-  "/api/admin/manual-logs",
-  verifyFirebaseUser,
-  verifyAdmin,
+  "/api/admin/wickspend/offers/numbers",
+  ...administrator,
   async (req, res) => {
     try {
-      const { title, description, price, category } = req.body;
-      const amount = Number(price);
-
-      if (
-        !validText(title, 150) ||
-        !Number.isFinite(amount) ||
-        amount < 0
-      ) {
-        return res.status(400).json({
-          error: "A valid title and price are required"
-        });
-      }
-
-      const ref = db().ref("manualLogs").push();
+      const offer = validateNumberOffer(req.body || {});
+      const ref = database()
+        .ref("settings/wickspendOffers/numbers")
+        .push();
 
       await ref.set({
-        title: title.trim(),
-        description: String(description || ""),
-        category: String(category || "General"),
-        price: amount,
-        active: true,
-        createdAt: admin.database.ServerValue.TIMESTAMP
+        ...offer,
+        createdAt: Date.now(),
+        updatedAt: Date.now()
       });
 
-      res.json({
+      res.status(201).json({
         success: true,
-        id: ref.key
+        id: ref.key,
+        offer
       });
     } catch (error) {
-      errorResponse(res, error);
+      res.status(400).json({
+        error: error.message
+      });
     }
   }
 );
 
 app.put(
-  "/api/admin/manual-logs/:id",
-  verifyFirebaseUser,
-  verifyAdmin,
+  "/api/admin/wickspend/offers/numbers/:id",
+  ...administrator,
   async (req, res) => {
     try {
-      const { title, description, price, category, active } = req.body;
-      const amount = Number(price);
+      const id = cleanString(req.params.id, 150);
 
-      if (
-        !validText(title, 150) ||
-        !Number.isFinite(amount) ||
-        amount < 0
-      ) {
+      if (!id || id.includes(".") || id.includes("#") ||
+          id.includes("$") || id.includes("[") || id.includes("]") ||
+          id.includes("/")) {
         return res.status(400).json({
-          error: "Invalid log details"
+          error: "Invalid offer ID."
         });
       }
 
-      const ref = db().ref(`manualLogs/${req.params.id}`);
+      const ref = database().ref(
+        `settings/wickspendOffers/numbers/${id}`
+      );
 
-      if (!(await ref.get()).exists()) {
+      const existing = await ref.once("value");
+
+      if (!existing.exists()) {
         return res.status(404).json({
-          error: "Log not found"
+          error: "Offer not found."
         });
       }
+
+      const offer = validateNumberOffer(req.body || {});
 
       await ref.update({
-        title: title.trim(),
-        description: String(description || ""),
-        category: String(category || "General"),
-        price: amount,
-        active: active !== false,
-        updatedAt: admin.database.ServerValue.TIMESTAMP
+        ...offer,
+        updatedAt: Date.now()
       });
 
-      res.json({ success: true });
+      res.json({
+        success: true,
+        id,
+        offer
+      });
     } catch (error) {
-      errorResponse(res, error);
+      res.status(400).json({
+        error: error.message
+      });
     }
   }
 );
 
 app.delete(
-  "/api/admin/manual-logs/:id",
-  verifyFirebaseUser,
-  verifyAdmin,
+  "/api/admin/wickspend/offers/numbers/:id",
+  ...administrator,
   async (req, res) => {
     try {
-      await db().ref(`manualLogs/${req.params.id}`).remove();
+      const id = cleanString(req.params.id, 150);
+
+      await database()
+        .ref(`settings/wickspendOffers/numbers/${id}`)
+        .remove();
+
       res.json({ success: true });
     } catch (error) {
-      errorResponse(res, error);
+      res.status(500).json({
+        error: "Unable to delete offer."
+      });
     }
   }
 );
 
-// --------------------------------------------------
-// WICKSPEND — NUMBERS AND LONG RENTALS ONLY
-// --------------------------------------------------
-
+// Customer catalogue: active admin-configured offers only.
 app.get(
   "/api/wickspend/numbers/catalog",
-  verifyFirebaseUser,
+  authenticated,
   async (req, res) => {
     try {
-      const url = new URL(`${WICKSPEND_URL}/numbers/catalog`);
+      const snapshot = await database()
+        .ref("settings/wickspendOffers/numbers")
+        .once("value");
 
-      if (req.query.country_code) {
-        url.searchParams.set(
-          "country_code",
-          String(req.query.country_code)
-        );
-      }
+      const offers = snapshot.val() || {};
 
-      if (req.query.service_code) {
-        url.searchParams.set(
-          "service_code",
-          String(req.query.service_code)
-        );
-      }
+      const activeOffers = Object.entries(offers)
+        .filter(([, offer]) =>
+          offer &&
+          offer.active === true &&
+          validMoney(Number(offer.price))
+        )
+        .map(([id, offer]) => ({
+          id,
+          country: offer.country,
+          country_code: offer.country_code,
+          service: offer.service,
+          price: Number(offer.price),
+          currency: "NGN"
+        }));
 
-      const result = await getJson(url, wickHeaders());
-
-      if (!result.ok) {
-        return res.status(502).json({
-          error: "WickSpend number catalogue unavailable",
-          providerStatus: result.status
-        });
-      }
-
-      const data = result.data;
-      const offers = Array.isArray(data)
-        ? data
-        : Array.isArray(data.offers)
-          ? data.offers
-          : Array.isArray(data.data)
-            ? data.data
-            : null;
-
-      if (!offers) {
-        return res.json(data);
-      }
-
-      const priced = await attachPrices(
-        offers,
-        "wickspend",
-        "numbers",
-        ["offer_id", "id", "provider_id", "service_code"]
-      );
-
-      res.json({
-        ...(!Array.isArray(data) ? data : {}),
-        offers: priced
+      res.json({ offers: activeOffers });
+    } catch (error) {
+      res.status(500).json({
+        error: "Unable to load available numbers."
       });
-    } catch (error) {
-      errorResponse(res, error, 502);
     }
   }
 );
 
-app.get(
-  "/api/wickspend/rentals/catalog",
-  verifyFirebaseUser,
-  async (req, res) => {
-    try {
-      const result = await getJson(
-        `${WICKSPEND_URL}/rentals/catalog`,
-        wickHeaders()
-      );
+// --------------------------------------------------
+// WICKSPEND NUMBER PURCHASE
+// Customer sends only offerId and request_key.
+// Provider IDs and selling price come from Firebase.
+// --------------------------------------------------
 
-      if (!result.ok) {
-        return res.status(502).json({
-          error: "WickSpend rental catalogue unavailable",
-          providerStatus: result.status
-        });
-      }
-
-      const data = result.data;
-      const offers = Array.isArray(data)
-        ? data
-        : Array.isArray(data.offers)
-          ? data.offers
-          : Array.isArray(data.data)
-            ? data.data
-            : null;
-
-      if (!offers) {
-        return res.json(data);
-      }
-
-      const priced = await attachPrices(
-        offers,
-        "wickspend",
-        "rentals",
-        ["offer_id", "id", "service_code"]
-      );
-
-      res.json({
-        ...(!Array.isArray(data) ? data : {}),
-        offers: priced
-      });
-    } catch (error) {
-      errorResponse(res, error, 502);
-    }
-  }
-);
-
-app.get(
-  "/api/wickspend/balance",
-  verifyFirebaseUser,
-  verifyAdmin,
-  async (req, res) => {
-    try {
-      const result = await getJson(
-        `${WICKSPEND_URL}/balance`,
-        wickHeaders()
-      );
-
-      res.status(result.ok ? 200 : 502).json(result.data);
-    } catch (error) {
-      errorResponse(res, error, 502);
-    }
-  }
-);
-
-// Purchase attempts are stored before calling the provider.
-// A 202 response is kept pending and must not be retried
-// with a new request key.
-
-async function createWickOrder({
-  uid,
-  kind,
-  requestKey,
-  payload,
-  customerPrice
-}) {
-  const ref = db().ref(
-    `users/${uid}/wickspendRequests/${requestKey}`
-  );
-
-  const existing = await ref.get();
-
-  if (existing.exists()) {
-    return {
-      duplicate: true,
-      order: existing.val()
-    };
-  }
-
-  const debitId = `wick_${requestKey}`;
-
-  await changeWallet(
-    uid,
-    Math.round(customerPrice * 100),
-    debitId,
-    "debit",
-    {
-      provider: "wickspend",
-      kind,
-      requestKey
-    }
-  );
-
-  const record = {
-    provider: "wickspend",
-    kind,
-    requestKey,
-    payload,
-    chargedAmount: Math.round(customerPrice * 100),
-    status: "processing",
-    createdAt: admin.database.ServerValue.TIMESTAMP
-  };
-
-  await ref.set(record);
-
-  return {
-    duplicate: false,
-    ref,
-    record
-  };
-}
-
-async function completeWickPurchase({
-  uid,
-  kind,
-  requestKey,
-  payload,
-  price,
-  endpoint
-}) {
-  if (!Number.isFinite(price) || price <= 0) {
-    return {
-      status: 400,
-      body: {
-        error: "This offer has no valid admin selling price"
-      }
-    };
-  }
-
-  const created = await createWickOrder({
-    uid,
-    kind,
-    requestKey,
-    payload,
-    customerPrice: price
-  });
-
-  if (created.duplicate) {
-    return {
-      status: 200,
-      body: {
-        duplicate: true,
-        order: created.order
-      }
-    };
-  }
-
-  let result;
-
-  try {
-    result = await postJson(
-      `${WICKSPEND_URL}${endpoint}`,
-      payload,
-      wickHeaders()
-    );
-  } catch (error) {
-    await created.ref.update({
-      status: "provider_status_unknown",
-      error: "Provider connection interrupted"
-    });
-
-    return {
-      status: 202,
-      body: {
-        status: "provider_status_unknown",
-        request_key: requestKey,
-        message: "Check the same request again. Do not create a new request key."
-      }
-    };
-  }
-
-  if (result.status === 202) {
-    await created.ref.update({
-      status: "provider_status_unknown",
-      providerResponse: result.data
-    });
-
-    return {
-      status: 202,
-      body: {
-        status: "provider_status_unknown",
-        request_key: requestKey,
-        provider: result.data
-      }
-    };
-  }
-
-  if (result.ok) {
-    await created.ref.update({
-      status: "submitted",
-      providerResponse: result.data,
-      updatedAt: admin.database.ServerValue.TIMESTAMP
-    });
-
-    return {
-      status: result.status,
-      body: result.data
-    };
-  }
-
-  // Refund only when the provider clearly reports a failure.
-  if (result.status === 409 || result.status === 400) {
-    await refundWallet(
-      uid,
-      created.record.chargedAmount,
-      `wick_refund_${requestKey}`,
-      {
-        provider: "wickspend",
-        requestKey,
-        reason: "Confirmed purchase failure"
-      }
-    );
-
-    await created.ref.update({
-      status: "failed_refunded",
-      providerResponse: result.data,
-      updatedAt: admin.database.ServerValue.TIMESTAMP
-    });
-  } else {
-    await created.ref.update({
-      status: "provider_status_unknown",
-      providerResponse: result.data
-    });
-
-    return {
-      status: 202,
-      body: {
-        status: "provider_status_unknown",
-        request_key: requestKey
-      }
-    };
-  }
-
-  return {
-    status: result.status,
-    body: result.data
-  };
-}
-
-// Number purchase
 app.post(
   "/api/wickspend/numbers/buy",
-  verifyFirebaseUser,
+  authenticated,
   async (req, res) => {
+    const uid = req.user.uid;
+    let requestKey;
+
     try {
-      const {
-        country_code,
-        service_code,
-        provider_id,
-        request_key,
-        offer_id
-      } = req.body;
+      requestKey = safeRequestKey(req.body.request_key);
 
-      const key = makeRequestKey(request_key);
+      const offerId = cleanString(req.body.offerId, 150);
 
-      if (
-        !validText(country_code, 10) ||
-        !validText(service_code, 100) ||
-        !validText(provider_id, 100) ||
-        !key
-      ) {
+      if (!offerId || /[.#$\[\]/]/.test(offerId)) {
         return res.status(400).json({
-          error: "country_code, service_code, provider_id and a request_key of at least 8 characters are required"
+          error: "A valid offerId is required."
         });
       }
 
-      const priceSnapshot = await db()
-        .ref(`settings/pricing/wickspend/numbers/${offer_id || service_code}`)
-        .get();
+      const offerSnapshot = await database()
+        .ref(`settings/wickspendOffers/numbers/${offerId}`)
+        .once("value");
 
-      const price = safeNumber(
-        priceSnapshot.child("price").val()
+      const offer = offerSnapshot.val();
+
+      if (!offer || offer.active !== true) {
+        return res.status(404).json({
+          error: "This number offer is unavailable."
+        });
+      }
+
+      const price = Number(offer.price);
+
+      if (!validMoney(price) || price <= 0) {
+        return res.status(500).json({
+          error: "The offer has an invalid selling price."
+        });
+      }
+
+      const reservation = await reservePurchase(
+        uid,
+        requestKey,
+        {
+          provider: "wickspend",
+          product: "number",
+          offerId,
+          price,
+          currency: "NGN"
+        }
       );
 
-      const result = await completeWickPurchase({
-        uid: req.user.uid,
-        kind: "number",
-        requestKey: key,
-        payload: {
-          country_code,
-          service_code,
-          provider_id,
-          request_key: key
-        },
-        price,
-        endpoint: "/numbers/buy"
-      });
-
-      res.status(result.status).json(result.body);
-    } catch (error) {
-      if (error.message === "INSUFFICIENT_BALANCE") {
-        return res.status(402).json({
-          error: "Insufficient CPOVERIFY wallet balance"
+      if (!reservation.created) {
+        return res.status(409).json({
+          error: "This purchase request has already been submitted. Do not create a new request key to repeat it.",
+          request: reservation.record
         });
       }
 
-      errorResponse(res, error);
+      const orderRef = database()
+        .ref(`users/${uid}/wickspendOrders/${requestKey}`);
+
+      await orderRef.set({
+        provider: "wickspend",
+        type: "number",
+        offerId,
+        country: offer.country,
+        service: offer.service,
+        price,
+        currency: "NGN",
+        status: "reserved",
+        createdAt: Date.now()
+      });
+
+      try {
+        const debit = await debitWallet(
+          uid,
+          price,
+          `wick_${requestKey}`,
+          `WickSpend ${offer.service} number`
+        );
+
+        await updatePurchase(uid, requestKey, {
+          status: "payment_debited",
+          balanceAfter: debit.balance
+        });
+
+        await orderRef.update({
+          status: "submitting",
+          balanceAfter: debit.balance
+        });
+      } catch (error) {
+        await updatePurchase(uid, requestKey, {
+          status: "payment_failed",
+          error: error.message
+        });
+
+        await orderRef.update({
+          status: "payment_failed"
+        });
+
+        return res.status(400).json({
+          error: error.message
+        });
+      }
+
+      let result;
+
+      try {
+        result = await wickspendPost("/numbers/buy", {
+          country_code: offer.country_code,
+          service_code: offer.service_code,
+          provider_id: offer.provider_id,
+          request_key: requestKey
+        });
+      } catch (error) {
+        // A timeout does not prove that the provider failed.
+        await updatePurchase(uid, requestKey, {
+          status: "provider_status_unknown",
+          error: "Provider response was not received."
+        });
+
+        await orderRef.update({
+          status: "provider_status_unknown"
+        });
+
+        return res.status(202).json({
+          status: "provider_status_unknown",
+          message: "Your purchase is being checked. Do not submit it again."
+        });
+      }
+
+      const reference = extractReference(result.data);
+
+      if (result.ok) {
+        const providerStatus = result.status === 202
+          ? "processing"
+          : "submitted";
+
+        await updatePurchase(uid, requestKey, {
+          status: providerStatus,
+          providerReference: reference,
+          providerResponse: result.data
+        });
+
+        await orderRef.update({
+          status: providerStatus,
+          reference,
+          providerResponse: result.data,
+          updatedAt: Date.now()
+        });
+
+        return res.status(result.status === 202 ? 202 : 200).json({
+          success: true,
+          status: providerStatus,
+          reference,
+          request_key: requestKey,
+          message: "Number purchase submitted."
+        });
+      }
+
+      // Refund only on a clear provider-side 4xx rejection.
+      if (result.status >= 400 && result.status < 500) {
+        await refundWallet(
+          uid,
+          price,
+          `wick_${requestKey}`,
+          "WickSpend number purchase rejected"
+        );
+
+        await updatePurchase(uid, requestKey, {
+          status: "provider_failed_refunded",
+          providerResponse: result.data
+        });
+
+        await orderRef.update({
+          status: "provider_failed_refunded",
+          providerResponse: result.data
+        });
+
+        return res.status(502).json({
+          error: providerErrorMessage(
+            result.data,
+            "The provider rejected the purchase. Your wallet has been refunded."
+          ),
+          refunded: true
+        });
+      }
+
+      // Server errors and ambiguous responses are not automatically refunded.
+      await updatePurchase(uid, requestKey, {
+        status: "provider_status_unknown",
+        providerResponse: result.data
+      });
+
+      await orderRef.update({
+        status: "provider_status_unknown",
+        providerResponse: result.data
+      });
+
+      return res.status(202).json({
+        status: "provider_status_unknown",
+        message: "The provider response is uncertain. Your request is saved for checking."
+      });
+    } catch (error) {
+      console.error("WickSpend purchase error:", error.message);
+
+      res.status(400).json({
+        error: error.message || "Unable to submit number purchase."
+      });
     }
   }
 );
 
-// Long rental purchase
-app.post(
-  "/api/wickspend/rentals/buy",
-  verifyFirebaseUser,
-  async (req, res) => {
-    try {
-      const {
-        service_code,
-        duration_minutes,
-        request_key,
-        country_code
-      } = req.body;
+// --------------------------------------------------
+// WICKSPEND ORDER HISTORY AND STATUS
+// --------------------------------------------------
 
-      const key = makeRequestKey(request_key);
-      const duration = Number(duration_minutes);
-
-      const allowedDurations = [
-        1440,
-        4320,
-        10080,
-        20160,
-        43200
-      ];
-
-      if (
-        !validText(service_code, 100) ||
-        !key ||
-        !allowedDurations.includes(duration)
-      ) {
-        return res.status(400).json({
-          error: "Invalid rental service, duration or request key"
-        });
-      }
-
-      const priceSnapshot = await db()
-        .ref(
-          `settings/pricing/wickspend/rentals/${service_code}_${duration}`
-        )
-        .get();
-
-      const price = safeNumber(
-        priceSnapshot.child("price").val()
-      );
-
-      const payload = {
-        service_code,
-        duration_minutes: duration,
-        request_key: key
-      };
-
-      if (validText(country_code, 10)) {
-        payload.country_code = country_code;
-      }
-
-      const result = await completeWickPurchase({
-        uid: req.user.uid,
-        kind: "rental",
-        requestKey: key,
-        payload,
-        price,
-        endpoint: "/rentals/buy"
-      });
-
-      res.status(result.status).json(result.body);
-    } catch (error) {
-      if (error.message === "INSUFFICIENT_BALANCE") {
-        return res.status(402).json({
-          error: "Insufficient CPOVERIFY wallet balance"
-        });
-      }
-
-      errorResponse(res, error);
-    }
-  }
-);
-
-// Customer order history
 app.get(
-  "/api/wickspend/orders",
-  verifyFirebaseUser,
+  "/api/wickspend/numbers/orders",
+  authenticated,
   async (req, res) => {
     try {
-      const snapshot = await db()
-        .ref(`users/${req.user.uid}/wickspendRequests`)
-        .get();
+      const snapshot = await database()
+        .ref(`users/${req.user.uid}/wickspendOrders`)
+        .once("value");
 
-      res.json(snapshot.val() || {});
+      const orders = snapshot.val() || {};
+
+      res.json({
+        orders: Object.entries(orders).map(([requestKey, order]) => ({
+          requestKey,
+          ...order
+        }))
+      });
     } catch (error) {
-      errorResponse(res, error);
+      res.status(500).json({
+        error: "Unable to load your number orders."
+      });
     }
   }
 );
 
-// Number status — only allow references recorded for this user.
 app.get(
   "/api/wickspend/numbers/status",
-  verifyFirebaseUser,
+  authenticated,
   async (req, res) => {
     try {
-      const reference = String(req.query.reference || "");
+      const reference = cleanString(req.query.reference, 200);
 
-      if (!validText(reference, 150)) {
+      if (!reference) {
         return res.status(400).json({
-          error: "A valid reference is required"
+          error: "Order reference is required."
         });
       }
 
-      const snapshot = await db()
-        .ref(`users/${req.user.uid}/wickspendRequests`)
-        .get();
+      const snapshot = await database()
+        .ref(`users/${req.user.uid}/wickspendOrders`)
+        .once("value");
 
       const orders = snapshot.val() || {};
-      const owned = Object.values(orders).some(order =>
-        order &&
-        order.kind === "number" &&
-        order.providerResponse &&
-        String(
-          order.providerResponse.reference ||
-          order.providerResponse.order?.reference ||
-          ""
-        ) === reference
+
+      const match = Object.entries(orders).find(
+        ([, order]) => order.reference === reference
       );
 
-      if (!owned) {
+      if (!match) {
         return res.status(404).json({
-          error: "Number order not found"
+          error: "Order not found."
         });
       }
 
-      const url = new URL(`${WICKSPEND_URL}/numbers/status`);
-      url.searchParams.set("reference", reference);
+      const result = await wickspendGet(
+        "/numbers/status?reference=" + encodeURIComponent(reference)
+      );
 
-      const result = await getJson(url, wickHeaders());
-      res.status(result.ok ? 200 : result.status).json(result.data);
-    } catch (error) {
-      errorResponse(res, error, 502);
-    }
-  }
-);
+      if (!result.ok) {
+        return sendProviderError(
+          res,
+          result,
+          "Unable to check number status."
+        );
+      }
 
-// Rental status — only allow references recorded for this user.
-app.get(
-  "/api/wickspend/rentals/order",
-  verifyFirebaseUser,
-  async (req, res) => {
-    try {
-      const reference = String(req.query.reference || "");
+      const [requestKey, order] = match;
 
-      if (!validText(reference, 150)) {
-        return res.status(400).json({
-          error: "A valid reference is required"
+      await database()
+        .ref(`users/${req.user.uid}/wickspendOrders/${requestKey}`)
+        .update({
+          latestStatus: result.data,
+          checkedAt: Date.now()
         });
-      }
 
-      const snapshot = await db()
-        .ref(`users/${req.user.uid}/wickspendRequests`)
-        .get();
-
-      const orders = snapshot.val() || {};
-      const owned = Object.values(orders).some(order =>
-        order &&
-        order.kind === "rental" &&
-        order.providerResponse &&
-        String(
-          order.providerResponse.reference ||
-          order.providerResponse.order?.reference ||
-          ""
-        ) === reference
-      );
-
-      if (!owned) {
-        return res.status(404).json({
-          error: "Rental order not found"
-        });
-      }
-
-      const url = new URL(`${WICKSPEND_URL}/rentals/order`);
-      url.searchParams.set("reference", reference);
-
-      const result = await getJson(url, wickHeaders());
-      res.status(result.ok ? 200 : result.status).json(result.data);
+      res.json({
+        order,
+        status: result.data
+      });
     } catch (error) {
-      errorResponse(res, error, 502);
+      res.status(500).json({
+        error: error.message || "Unable to check order status."
+      });
     }
   }
 );
 
-// Admin can inspect provider order lists.
-app.get(
-  "/api/admin/wickspend/numbers/orders",
-  verifyFirebaseUser,
-  verifyAdmin,
-  async (req, res) => {
-    try {
-      const result = await getJson(
-        `${WICKSPEND_URL}/numbers/orders`,
-        wickHeaders()
-      );
-
-      res.status(result.ok ? 200 : 502).json(result.data);
-    } catch (error) {
-      errorResponse(res, error, 502);
-    }
-  }
-);
-
-app.get(
-  "/api/admin/wickspend/rentals/orders",
-  verifyFirebaseUser,
-  verifyAdmin,
-  async (req, res) => {
-    try {
-      const result = await getJson(
-        `${WICKSPEND_URL}/rentals/orders`,
-        wickHeaders()
-      );
-
-      res.status(result.ok ? 200 : 502).json(result.data);
-    } catch (error) {
-      errorResponse(res, error, 502);
-    }
-  }
-);
-
-// Cancellation helper.
-// The CPOVERIFY wallet is credited only after WickSpend
-// returns a successful, confirmed cancellation.
-async function cancelWickOrder(uid, kind, reference) {
-  const snapshot = await db()
-    .ref(`users/${uid}/wickspendRequests`)
-    .get();
-
-  const orders = snapshot.val() || {};
-
-  const entry = Object.entries(orders).find(([, order]) =>
-    order &&
-    order.kind === kind &&
-    order.providerResponse &&
-    String(
-      order.providerResponse.reference ||
-      order.providerResponse.order?.reference ||
-      ""
-    ) === reference
-  );
-
-  if (!entry) {
-    return {
-      status: 404,
-      body: { error: "Order not found" }
-    };
-  }
-
-  const [key, order] = entry;
-
-  if (order.status === "refunded") {
-    return {
-      status: 200,
-      body: { success: true, already_refunded: true }
-    };
-  }
-
-  const endpoint = kind === "number"
-    ? "/numbers/cancel"
-    : "/rentals/cancel";
-
-  const result = await postJson(
-    `${WICKSPEND_URL}${endpoint}`,
-    { reference },
-    wickHeaders()
-  );
-
-  if (result.status === 202) {
-    return {
-      status: 202,
-      body: {
-        status: "cancellation_status_unknown",
-        provider: result.data
-      }
-    };
-  }
-
-  if (!result.ok) {
-    return {
-      status: result.status,
-      body: result.data
-    };
-  }
-
-  await refundWallet(
-    uid,
-    safeNumber(order.chargedAmount),
-    `wick_cancel_refund_${key}`,
-    {
-      provider: "wickspend",
-      kind,
-      reference
-    }
-  );
-
-  await db()
-    .ref(`users/${uid}/wickspendRequests/${key}`)
-    .update({
-      status: "refunded",
-      cancellationResponse: result.data,
-      updatedAt: admin.database.ServerValue.TIMESTAMP
-    });
-
-  return {
-    status: 200,
-    body: result.data
-  };
-}
+// --------------------------------------------------
+// WICKSPEND NUMBER CANCELLATION
+//
+// The provider must explicitly confirm cancellation
+// before the customer's wallet is credited.
+// --------------------------------------------------
 
 app.post(
   "/api/wickspend/numbers/cancel",
-  verifyFirebaseUser,
+  authenticated,
   async (req, res) => {
     try {
-      const reference = String(req.body.reference || "");
+      const reference = cleanString(req.body.reference, 200);
 
-      if (!validText(reference, 150)) {
+      if (!reference) {
         return res.status(400).json({
-          error: "Reference is required"
+          error: "Order reference is required."
         });
       }
 
-      const result = await cancelWickOrder(
-        req.user.uid,
-        "number",
-        reference
+      const ordersRef = database()
+        .ref(`users/${req.user.uid}/wickspendOrders`);
+
+      const snapshot = await ordersRef.once("value");
+      const orders = snapshot.val() || {};
+
+      const match = Object.entries(orders).find(
+        ([, order]) => order.reference === reference
       );
 
-      res.status(result.status).json(result.body);
-    } catch (error) {
-      errorResponse(res, error);
-    }
-  }
-);
-
-app.post(
-  "/api/wickspend/rentals/cancel",
-  verifyFirebaseUser,
-  async (req, res) => {
-    try {
-      const reference = String(req.body.reference || "");
-
-      if (!validText(reference, 150)) {
-        return res.status(400).json({
-          error: "Reference is required"
+      if (!match) {
+        return res.status(404).json({
+          error: "Order not found."
         });
       }
 
-      const result = await cancelWickOrder(
-        req.user.uid,
-        "rental",
+      const [requestKey, order] = match;
+
+      if (order.status === "cancelled_refunded") {
+        return res.json({
+          success: true,
+          refunded: true,
+          message: "This order has already been refunded."
+        });
+      }
+
+      const result = await wickspendPost("/numbers/cancel", {
         reference
-      );
-
-      res.status(result.status).json(result.body);
-    } catch (error) {
-      errorResponse(res, error);
-    }
-  }
-);
-
-// --------------------------------------------------
-// MYSMM — ACCOUNT BOOSTING
-// --------------------------------------------------
-
-app.get(
-  "/api/mysmm/services",
-  verifyFirebaseUser,
-  async (req, res) => {
-    try {
-      const url = mySmmUrl("services");
-
-      const result = await getJson(url);
+      });
 
       if (!result.ok) {
-        return res.status(502).json({
-          error: "MySMM services request failed"
+        return sendProviderError(
+          res,
+          result,
+          "Cancellation could not be confirmed."
+        );
+      }
+
+      if (!confirmedProviderSuccess(result.data)) {
+        await ordersRef.child(requestKey).update({
+          cancellationStatus: "awaiting_confirmation",
+          cancellationResponse: result.data,
+          updatedAt: Date.now()
         });
+
+        return res.status(202).json({
+          status: "awaiting_confirmation",
+          message: "The provider has not yet confirmed cancellation. No refund has been issued."
+        });
+      }
+
+      await refundWallet(
+        req.user.uid,
+        Number(order.price),
+        `wick_${requestKey}`,
+        "WickSpend number cancellation refund"
+      );
+
+      await ordersRef.child(requestKey).update({
+        status: "cancelled_refunded",
+        cancellationResponse: result.data,
+        cancelledAt: Date.now()
+      });
+
+      await updatePurchase(req.user.uid, requestKey, {
+        status: "cancelled_refunded"
+      });
+
+      res.json({
+        success: true,
+        refunded: true,
+        amount: Number(order.price),
+        currency: "NGN"
+      });
+    } catch (error) {
+      console.error("WickSpend cancellation error:", error.message);
+
+      res.status(500).json({
+        error: error.message || "Unable to cancel number."
+      });
+    }
+  }
+);
+
+// --------------------------------------------------
+// SAMEEHA SOCIAL HUB: ACCOUNT LOGS
+// --------------------------------------------------
+
+async function sameehaGet(path) {
+  if (!process.env.SAMEEHA_API_KEY) {
+    throw new Error("SAMEEHA_API_KEY is not configured.");
+  }
+
+  return providerFetch(SAMEEHA_URL + path, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${process.env.SAMEEHA_API_KEY}`
+    }
+  });
+}
+
+app.get(
+  "/api/provider/categories",
+  authenticated,
+  async (req, res) => {
+    try {
+      const result = await sameehaGet("/categories");
+
+      if (!result.ok) {
+        return sendProviderError(
+          res,
+          result,
+          "Unable to load Account Logs categories."
+        );
       }
 
       res.json(result.data);
     } catch (error) {
-      errorResponse(res, error, 502);
+      console.error("Sameeha categories error:", error.message);
+
+      res.status(500).json({
+        error: "Sameeha provider connection failed."
+      });
     }
   }
 );
 
+// Existing frontend app.js uses this route.
 app.get(
-  "/api/admin/mysmm/balance",
-  verifyFirebaseUser,
-  verifyAdmin,
+  "/api/provider/products",
   async (req, res) => {
     try {
-      const url = mySmmUrl("balance");
-      const result = await getJson(url);
+      const result = await sameehaGet("/products");
 
-      res.status(result.ok ? 200 : 502).json(result.data);
+      if (!result.ok) {
+        return sendProviderError(
+          res,
+          result,
+          "Unable to load Account Logs listings."
+        );
+      }
+
+      res.json(result.data);
     } catch (error) {
-      errorResponse(res, error, 502);
+      console.error("Sameeha products error:", error.message);
+
+      res.status(500).json({
+        error: "Account Logs provider connection failed."
+      });
+    }
+  }
+);
+
+// --------------------------------------------------
+// ADMIN-MANAGED MANUAL ACCOUNT LOG LISTINGS
+// --------------------------------------------------
+
+app.get(
+  "/api/admin/account-logs/manual",
+  ...administrator,
+  async (req, res) => {
+    try {
+      const snapshot = await database()
+        .ref("settings/accountLogs/manual")
+        .once("value");
+
+      const listings = snapshot.val() || {};
+
+      res.json({
+        listings: Object.entries(listings).map(([id, item]) => ({
+          id,
+          ...item
+        }))
+      });
+    } catch (error) {
+      res.status(500).json({
+        error: "Unable to load manual listings."
+      });
     }
   }
 );
 
 app.post(
-  "/api/mysmm/order",
-  verifyFirebaseUser,
+  "/api/admin/account-logs/manual",
+  ...administrator,
   async (req, res) => {
     try {
-      if (!["per1000", "perunit"].includes(MYSMM_RATE_UNIT)) {
-        return res.status(503).json({
-          error: "MySMM order placement is disabled until MYSMM_RATE_UNIT is confirmed as per1000 or perunit"
+      const title = cleanString(req.body.title, 150);
+      const description = cleanString(req.body.description, 1000);
+      const price = Number(req.body.price);
+
+      if (!title || !validMoney(price) || price <= 0) {
+        return res.status(400).json({
+          error: "A title and valid naira price are required."
         });
       }
 
-      const { service, link, quantity, request_key } = req.body;
-      const key = makeRequestKey(request_key);
-      const qty = Number(quantity);
+      const ref = database()
+        .ref("settings/accountLogs/manual")
+        .push();
+
+      const listing = {
+        title,
+        description,
+        price,
+        active: req.body.active !== false,
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      };
+
+      await ref.set(listing);
+
+      res.status(201).json({
+        success: true,
+        id: ref.key,
+        listing
+      });
+    } catch (error) {
+      res.status(500).json({
+        error: "Unable to create manual listing."
+      });
+    }
+  }
+);
+
+app.put(
+  "/api/admin/account-logs/manual/:id",
+  ...administrator,
+  async (req, res) => {
+    try {
+      const id = cleanString(req.params.id, 150);
+      const title = cleanString(req.body.title, 150);
+      const description = cleanString(req.body.description, 1000);
+      const price = Number(req.body.price);
 
       if (
-        !validText(String(service || ""), 80) ||
-        !validText(link, 2000) ||
-        !Number.isSafeInteger(qty) ||
-        qty < 1 ||
-        !key
+        !id ||
+        /[.#$\[\]/]/.test(id) ||
+        !title ||
+        !validMoney(price) ||
+        price <= 0
       ) {
         return res.status(400).json({
-          error: "Invalid service, link, quantity or request_key"
+          error: "Invalid listing details."
         });
       }
 
-      let target;
+      const ref = database()
+        .ref(`settings/accountLogs/manual/${id}`);
 
-      try {
-        target = new URL(link);
-      } catch {
-        return res.status(400).json({
-          error: "A valid link is required"
-        });
-      }
+      const snapshot = await ref.once("value");
 
-      if (!["http:", "https:"].includes(target.protocol)) {
-        return res.status(400).json({
-          error: "Only HTTP and HTTPS links are accepted"
-        });
-      }
-
-      const existingRef = db().ref(
-        `users/${req.user.uid}/mysmmRequests/${key}`
-      );
-
-      const existing = await existingRef.get();
-
-      if (existing.exists()) {
-        return res.json({
-          duplicate: true,
-          order: existing.val()
-        });
-      }
-
-      // Fetch trusted provider service details.
-      const servicesResult = await getJson(mySmmUrl("services"));
-
-      if (!servicesResult.ok || !Array.isArray(servicesResult.data)) {
-        return res.status(502).json({
-          error: "Unable to verify MySMM service"
-        });
-      }
-
-      const selected = servicesResult.data.find(
-        item => String(item.service) === String(service)
-      );
-
-      if (!selected) {
+      if (!snapshot.exists()) {
         return res.status(404).json({
-          error: "MySMM service not found"
+          error: "Listing not found."
         });
       }
 
-      const min = Number(selected.min);
-      const max = Number(selected.max);
-      const rate = Number(selected.rate);
+      await ref.update({
+        title,
+        description,
+        price,
+        active: req.body.active !== false,
+        updatedAt: Date.now()
+      });
+
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({
+        error: "Unable to update listing."
+      });
+    }
+  }
+);
+
+app.delete(
+  "/api/admin/account-logs/manual/:id",
+  ...administrator,
+  async (req, res) => {
+    try {
+      const id = cleanString(req.params.id, 150);
+
+      await database()
+        .ref(`settings/accountLogs/manual/${id}`)
+        .remove();
+
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({
+        error: "Unable to delete listing."
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/account-logs/manual",
+  authenticated,
+  async (req, res) => {
+    try {
+      const snapshot = await database()
+        .ref("settings/accountLogs/manual")
+        .once("value");
+
+      const listings = snapshot.val() || {};
+
+      res.json({
+        listings: Object.entries(listings)
+          .filter(([, item]) => item && item.active === true)
+          .map(([id, item]) => ({
+            id,
+            title: item.title,
+            description: item.description || "",
+            price: Number(item.price),
+            currency: "NGN"
+          }))
+      });
+    } catch (error) {
+      res.status(500).json({
+        error: "Unable to load manual Account Logs listings."
+      });
+    }
+  }
+);
+
+// --------------------------------------------------
+// MY SMM: ACCOUNT BOOSTING
+// Provider rate is per 1,000.
+// Formula:
+// rate * quantity / 1000 * USD_TO_NGN_RATE
+// * (1 + BOOST_MARKUP_PERCENT / 100)
+// --------------------------------------------------
+
+function mysmmUrl(params) {
+  if (!process.env.MYSMM_API_KEY) {
+    throw new Error("MYSMM_API_KEY is not configured.");
+  }
+
+  const url = new URL(MYSMM_URL);
+  url.searchParams.set("key", process.env.MYSMM_API_KEY);
+
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null) {
+      url.searchParams.set(key, String(value));
+    }
+  });
+
+  return url;
+}
+
+async function mysmmRequest(params, method = "GET") {
+  const url = mysmmUrl(params);
+
+  return providerFetch(url.toString(), {
+    method
+  });
+}
+
+async function mysmmPost(params) {
+  const url = mysmmUrl({});
+
+  const body = new URLSearchParams();
+
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null) {
+      body.set(key, String(value));
+    }
+  });
+
+  return providerFetch(url.toString(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: body.toString()
+  });
+}
+
+function calculateBoostPrice(rate, quantity) {
+  const base = Number(rate) * Number(quantity) / 1000;
+
+  return money(
+    base *
+    USD_TO_NGN_RATE *
+    (1 + BOOST_MARKUP_PERCENT / 100)
+  );
+}
+
+// Admin: check MySMM provider balance.
+app.get(
+  "/api/admin/mysmm/balance",
+  ...administrator,
+  async (req, res) => {
+    try {
+      const result = await mysmmRequest({
+        action: "balance"
+      });
+
+      if (!result.ok) {
+        return sendProviderError(
+          res,
+          result,
+          "Unable to retrieve MySMM balance."
+        );
+      }
+
+      res.json(result.data);
+    } catch (error) {
+      res.status(500).json({
+        error: error.message || "MySMM connection failed."
+      });
+    }
+  }
+);
+
+// Load boosting services and calculate customer prices.
+app.get(
+  "/api/boost/services",
+  authenticated,
+  async (req, res) => {
+    try {
+      const result = await mysmmRequest({
+        action: "services"
+      });
+
+      if (!result.ok) {
+        return sendProviderError(
+          res,
+          result,
+          "Unable to load boosting services."
+        );
+      }
+
+      const services = Array.isArray(result.data)
+        ? result.data
+        : result.data.services || result.data.data || [];
+
+      if (!Array.isArray(services)) {
+        return res.status(502).json({
+          error: "MySMM returned an unexpected services response."
+        });
+      }
+
+      const pricedServices = services.map(service => ({
+        ...service,
+        customerPricePer1000: calculateBoostPrice(
+          Number(service.rate || 0),
+          1000
+        ),
+        currency: "NGN"
+      }));
+
+      res.json({
+        services: pricedServices,
+        usdToNgnRate: USD_TO_NGN_RATE,
+        markupPercent: BOOST_MARKUP_PERCENT
+      });
+    } catch (error) {
+      console.error("MySMM services error:", error.message);
+
+      res.status(500).json({
+        error: error.message || "Unable to load boosting services."
+      });
+    }
+  }
+);
+
+// Place a boosting order.
+app.post(
+  "/api/boost/orders",
+  authenticated,
+  async (req, res) => {
+    const uid = req.user.uid;
+
+    try {
+      const requestKey = safeRequestKey(req.body.request_key);
+      const service = cleanString(String(req.body.service || ""), 100);
+      const link = cleanString(req.body.link, 1500);
+      const quantity = Number(req.body.quantity);
 
       if (
-        !Number.isFinite(rate) ||
-        !Number.isFinite(min) ||
-        !Number.isFinite(max) ||
-        qty < min ||
-        qty > max
+        !service ||
+        !link ||
+        !Number.isSafeInteger(quantity) ||
+        quantity <= 0
       ) {
         return res.status(400).json({
-          error: "Quantity is outside the provider's allowed range"
+          error: "A service, valid link and positive whole-number quantity are required."
         });
       }
 
-      const baseCost = MYSMM_RATE_UNIT === "per1000"
-        ? rate * qty / 1000
-        : rate * qty;
+      // Fetch the provider's actual service rate.
+      const servicesResult = await mysmmRequest({
+        action: "services"
+      });
 
-      const chargeNGN = Math.ceil(
-        baseCost *
-        USD_TO_NGN_RATE *
-        (1 + BOOST_MARKUP_PERCENT / 100) *
-        100
+      if (!servicesResult.ok) {
+        return sendProviderError(
+          res,
+          servicesResult,
+          "Unable to verify the boosting service."
+        );
+      }
+
+      const services = Array.isArray(servicesResult.data)
+        ? servicesResult.data
+        : servicesResult.data.services || servicesResult.data.data || [];
+
+      const selectedService = services.find(
+        item => String(item.service) === service
       );
 
-      if (!Number.isSafeInteger(chargeNGN) || chargeNGN <= 0) {
+      if (!selectedService) {
         return res.status(400).json({
-          error: "Unable to calculate order price"
+          error: "The selected boosting service is unavailable."
         });
       }
 
-      await changeWallet(
-        req.user.uid,
-        chargeNGN,
-        `mysmm_${key}`,
-        "debit",
+      const min = Number(selectedService.min || 1);
+      const max = Number(selectedService.max || Number.MAX_SAFE_INTEGER);
+
+      if (quantity < min || quantity > max) {
+        return res.status(400).json({
+          error: `Quantity must be between ${min} and ${max}.`
+        });
+      }
+
+      const rate = Number(selectedService.rate);
+
+      if (!Number.isFinite(rate) || rate < 0) {
+        return res.status(502).json({
+          error: "The provider returned an invalid service rate."
+        });
+      }
+
+      const price = calculateBoostPrice(rate, quantity);
+
+      if (!Number.isFinite(price) || price <= 0) {
+        return res.status(400).json({
+          error: "Unable to calculate the order price."
+        });
+      }
+
+      const reservation = await reservePurchase(
+        uid,
+        requestKey,
         {
           provider: "mysmm",
+          product: "boost",
           service,
-          quantity: qty,
-          requestKey: key
+          quantity,
+          price,
+          currency: "NGN"
         }
       );
 
-      await existingRef.set({
+      if (!reservation.created) {
+        return res.status(409).json({
+          error: "This order request has already been submitted. Do not submit it again with a new request key.",
+          request: reservation.record
+        });
+      }
+
+      const orderRef = database()
+        .ref(`users/${uid}/boostOrders/${requestKey}`);
+
+      await orderRef.set({
         provider: "mysmm",
-        service: String(service),
+        service,
+        serviceName: selectedService.name || "",
         link,
-        quantity: qty,
-        chargedAmount: chargeNGN,
-        status: "processing",
-        requestKey: key,
-        createdAt: admin.database.ServerValue.TIMESTAMP
+        quantity,
+        providerRate: rate,
+        price,
+        currency: "NGN",
+        status: "reserved",
+        createdAt: Date.now()
       });
 
-      const addUrl = mySmmUrl("add");
+      try {
+        const debit = await debitWallet(
+          uid,
+          price,
+          `mysmm_${requestKey}`,
+          "Account boosting order"
+        );
 
-      const form = new URLSearchParams({
-        service: String(service),
-        link,
-        quantity: String(qty)
-      });
+        await updatePurchase(uid, requestKey, {
+          status: "payment_debited",
+          balanceAfter: debit.balance
+        });
 
-      const result = await providerRequest(addUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded"
-        },
-        body: form.toString()
-      });
+        await orderRef.update({
+          status: "submitting",
+          balanceAfter: debit.balance
+        });
+      } catch (error) {
+        await updatePurchase(uid, requestKey, {
+          status: "payment_failed",
+          error: error.message
+        });
 
-      if (
-        result.ok &&
-        result.data &&
-        result.data.order !== undefined
-      ) {
-        await existingRef.update({
-          providerOrderId: String(result.data.order),
+        await orderRef.update({
+          status: "payment_failed"
+        });
+
+        return res.status(400).json({
+          error: error.message
+        });
+      }
+
+      let result;
+
+      try {
+        result = await mysmmPost({
+          action: "add",
+          service,
+          link,
+          quantity
+        });
+      } catch (error) {
+        await updatePurchase(uid, requestKey, {
+          status: "provider_status_unknown"
+        });
+
+        await orderRef.update({
+          status: "provider_status_unknown"
+        });
+
+        return res.status(202).json({
+          status: "provider_status_unknown",
+          message: "Your boosting order is being checked. Do not submit it again."
+        });
+      }
+
+      const providerOrderId = result.data &&
+        (result.data.order || result.data.order_id);
+
+      if (result.ok && providerOrderId) {
+        await updatePurchase(uid, requestKey, {
           status: "submitted",
-          providerResponse: result.data,
-          updatedAt: admin.database.ServerValue.TIMESTAMP
+          providerOrderId: String(providerOrderId)
+        });
+
+        await orderRef.update({
+          status: "submitted",
+          providerOrderId: String(providerOrderId),
+          providerResponse: result.data
         });
 
         return res.json({
           success: true,
-          order: result.data.order,
-          chargedAmount: chargeNGN / 100
+          status: "submitted",
+          order: String(providerOrderId),
+          price,
+          currency: "NGN"
         });
       }
 
-      // A clear provider error is refundable.
-      // Network uncertainty is not.
-      if (result.ok && result.data && result.data.error) {
+      // Clear provider rejection: refund the wallet.
+      if (result.status >= 400 && result.status < 500) {
         await refundWallet(
-          req.user.uid,
-          chargeNGN,
-          `mysmm_refund_${key}`,
-          {
-            provider: "mysmm",
-            reason: "Provider rejected order"
-          }
+          uid,
+          price,
+          `mysmm_${requestKey}`,
+          "MySMM order rejected"
         );
 
-        await existingRef.update({
-          status: "failed_refunded",
+        await updatePurchase(uid, requestKey, {
+          status: "provider_failed_refunded",
           providerResponse: result.data
         });
 
-        return res.status(409).json({
-          error: "MySMM rejected the order",
-          provider: result.data
+        await orderRef.update({
+          status: "provider_failed_refunded",
+          providerResponse: result.data
+        });
+
+        return res.status(502).json({
+          error: providerErrorMessage(
+            result.data,
+            "The boosting provider rejected the order. Your wallet has been refunded."
+          ),
+          refunded: true
         });
       }
 
-      await existingRef.update({
+      await updatePurchase(uid, requestKey, {
+        status: "provider_status_unknown",
+        providerResponse: result.data
+      });
+
+      await orderRef.update({
         status: "provider_status_unknown",
         providerResponse: result.data
       });
 
       res.status(202).json({
         status: "provider_status_unknown",
-        request_key: key,
-        message: "Do not submit this purchase again with a new request key."
+        message: "The provider response is uncertain. Your order has been saved for checking."
       });
     } catch (error) {
-      if (error.message === "INSUFFICIENT_BALANCE") {
-        return res.status(402).json({
-          error: "Insufficient CPOVERIFY wallet balance"
-        });
-      }
+      console.error("Boost order error:", error.message);
 
-      errorResponse(res, error);
-    }
-  }
-);
-
-app.get(
-  "/api/mysmm/orders",
-  verifyFirebaseUser,
-  async (req, res) => {
-    try {
-      const snapshot = await db()
-        .ref(`users/${req.user.uid}/mysmmRequests`)
-        .get();
-
-      res.json(snapshot.val() || {});
-    } catch (error) {
-      errorResponse(res, error);
-    }
-  }
-);
-
-app.get(
-  "/api/mysmm/status",
-  verifyFirebaseUser,
-  async (req, res) => {
-    try {
-      const key = String(req.query.request_key || "");
-
-      if (!validText(key, 120)) {
-        return res.status(400).json({
-          error: "request_key is required"
-        });
-      }
-
-      const ref = db().ref(
-        `users/${req.user.uid}/mysmmRequests/${key}`
-      );
-
-      const snapshot = await ref.get();
-
-      if (!snapshot.exists()) {
-        return res.status(404).json({
-          error: "Order not found"
-        });
-      }
-
-      const order = snapshot.val();
-
-      if (!order.providerOrderId) {
-        return res.status(202).json({
-          status: order.status
-        });
-      }
-
-      const url = mySmmUrl("status");
-      url.searchParams.set("order", order.providerOrderId);
-
-      const result = await getJson(url);
-
-      res.status(result.ok ? 200 : 502).json(result.data);
-    } catch (error) {
-      errorResponse(res, error, 502);
-    }
-  }
-);
-
-app.post(
-  "/api/mysmm/cancel",
-  verifyFirebaseUser,
-  async (req, res) => {
-    try {
-      const key = String(req.body.request_key || "");
-
-      if (!validText(key, 120)) {
-        return res.status(400).json({
-          error: "request_key is required"
-        });
-      }
-
-      const ref = db().ref(
-        `users/${req.user.uid}/mysmmRequests/${key}`
-      );
-
-      const snapshot = await ref.get();
-
-      if (!snapshot.exists()) {
-        return res.status(404).json({
-          error: "Order not found"
-        });
-      }
-
-      const order = snapshot.val();
-
-      if (!order.providerOrderId) {
-        return res.status(409).json({
-          error: "This order has no confirmed provider order ID"
-        });
-      }
-
-      const url = mySmmUrl("cancel");
-
-      const form = new URLSearchParams({
-        order: String(order.providerOrderId)
+      res.status(400).json({
+        error: error.message || "Unable to place boosting order."
       });
+    }
+  }
+);
 
-      const result = await providerRequest(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded"
-        },
-        body: form.toString()
+// User's boosting order history.
+app.get(
+  "/api/boost/orders",
+  authenticated,
+  async (req, res) => {
+    try {
+      const snapshot = await database()
+        .ref(`users/${req.user.uid}/boostOrders`)
+        .once("value");
+
+      const orders = snapshot.val() || {};
+
+      res.json({
+        orders: Object.entries(orders).map(([requestKey, order]) => ({
+          requestKey,
+          ...order
+        }))
+      });
+    } catch (error) {
+      res.status(500).json({
+        error: "Unable to load boosting orders."
+      });
+    }
+  }
+);
+
+// Check MySMM order status.
+app.get(
+  "/api/boost/orders/:requestKey/status",
+  authenticated,
+  async (req, res) => {
+    try {
+      const requestKey = safeRequestKey(req.params.requestKey);
+
+      const ref = database().ref(
+        `users/${req.user.uid}/boostOrders/${requestKey}`
+      );
+
+      const snapshot = await ref.once("value");
+      const order = snapshot.val();
+
+      if (!order || !order.providerOrderId) {
+        return res.status(404).json({
+          error: "Provider order reference is not available for this order."
+        });
+      }
+
+      const result = await mysmmRequest({
+        action: "status",
+        order: order.providerOrderId
       });
 
       if (!result.ok) {
-        return res.status(502).json(result.data);
+        return sendProviderError(
+          res,
+          result,
+          "Unable to check boosting order status."
+        );
       }
 
       await ref.update({
-        cancelResponse: result.data,
-        cancelRequestedAt: admin.database.ServerValue.TIMESTAMP
+        latestStatus: result.data,
+        checkedAt: Date.now()
       });
 
-      // MySMM cancellation response does not specify the amount
-      // actually refunded. Therefore no automatic wallet credit.
       res.json({
-        success: true,
-        provider: result.data,
-        message: "Cancellation response received. Wallet refund requires confirmed provider refund details."
+        order,
+        status: result.data
       });
     } catch (error) {
-      errorResponse(res, error);
+      res.status(500).json({
+        error: error.message || "Unable to check order status."
+      });
     }
   }
 );
 
+// Request cancellation from MySMM.
+// The supplied API response does not establish a refund amount.
+// Therefore this route does not automatically credit the wallet.
 app.post(
-  "/api/mysmm/refill",
-  verifyFirebaseUser,
+  "/api/boost/orders/:requestKey/cancel",
+  authenticated,
   async (req, res) => {
     try {
-      const key = String(req.body.request_key || "");
+      const requestKey = safeRequestKey(req.params.requestKey);
 
-      const snapshot = await db()
-        .ref(`users/${req.user.uid}/mysmmRequests/${key}`)
-        .get();
+      const ref = database().ref(
+        `users/${req.user.uid}/boostOrders/${requestKey}`
+      );
 
-      if (!snapshot.exists()) {
-        return res.status(404).json({
-          error: "Order not found"
-        });
-      }
-
+      const snapshot = await ref.once("value");
       const order = snapshot.val();
 
-      if (!order.providerOrderId) {
-        return res.status(409).json({
-          error: "Provider order ID is unavailable"
+      if (!order || !order.providerOrderId) {
+        return res.status(404).json({
+          error: "Boosting order not found."
         });
       }
 
-      const url = mySmmUrl("refill");
-
-      const form = new URLSearchParams({
-        order: String(order.providerOrderId)
+      const result = await mysmmPost({
+        action: "cancel",
+        orders: order.providerOrderId
       });
 
-      const result = await providerRequest(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded"
-        },
-        body: form.toString()
+      if (!result.ok) {
+        return sendProviderError(
+          res,
+          result,
+          "Unable to request cancellation."
+        );
+      }
+
+      await ref.update({
+        cancellationResponse: result.data,
+        cancellationRequestedAt: Date.now(),
+        status: "cancellation_requested"
       });
 
-      res.status(result.ok ? 200 : 502).json(result.data);
+      res.json({
+        success: true,
+        status: "cancellation_requested",
+        message: "Cancellation was requested. Any refund must be confirmed separately."
+      });
     } catch (error) {
-      errorResponse(res, error, 502);
+      res.status(500).json({
+        error: error.message || "Unable to cancel boosting order."
+      });
+    }
+  }
+);
+
+// Request a MySMM refill.
+app.post(
+  "/api/boost/orders/:requestKey/refill",
+  authenticated,
+  async (req, res) => {
+    try {
+      const requestKey = safeRequestKey(req.params.requestKey);
+
+      const ref = database().ref(
+        `users/${req.user.uid}/boostOrders/${requestKey}`
+      );
+
+      const snapshot = await ref.once("value");
+      const order = snapshot.val();
+
+      if (!order || !order.providerOrderId) {
+        return res.status(404).json({
+          error: "Boosting order not found."
+        });
+      }
+
+      const result = await mysmmPost({
+        action: "refill",
+        order: order.providerOrderId
+      });
+
+      if (!result.ok) {
+        return sendProviderError(
+          res,
+          result,
+          "Unable to request refill."
+        );
+      }
+
+      await ref.update({
+        refillResponse: result.data,
+        refillRequestedAt: Date.now()
+      });
+
+      res.json({
+        success: true,
+        result: result.data
+      });
+    } catch (error) {
+      res.status(500).json({
+        error: error.message || "Unable to request refill."
+      });
     }
   }
 );
 
 // --------------------------------------------------
-// START
+// ADMIN: PROVIDER ORDER OVERVIEWS
+// --------------------------------------------------
+
+app.get(
+  "/api/admin/wickspend/orders",
+  ...administrator,
+  async (req, res) => {
+    try {
+      const result = await wickspendGet("/numbers/orders");
+
+      if (!result.ok) {
+        return sendProviderError(
+          res,
+          result,
+          "Unable to load WickSpend orders."
+        );
+      }
+
+      res.json(result.data);
+    } catch (error) {
+      res.status(500).json({
+        error: error.message || "Unable to load WickSpend orders."
+      });
+    }
+  }
+);
+
+// --------------------------------------------------
+// START SERVER
 // --------------------------------------------------
 
 app.listen(PORT, () => {
